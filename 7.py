@@ -1,6 +1,4 @@
-from allennlp.commands.elmo import ElmoEmbedder
 import tensorflow as tf
-import tensorflow.contrib.eager as tfe
 import tokenization
 import collections
 import json
@@ -10,7 +8,11 @@ import random
 import modeling
 import optimization
 import six
-from pprint import pprint
+
+from keras.layers import LSTM
+from keras.layers import Bidirectional
+from keras.layers import Dropout
+from keras.layers import Dense
 
 #######
 flags = tf.flags
@@ -84,7 +86,7 @@ flags.DEFINE_integer("predict_batch_size", 8,
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 1.0,
+flags.DEFINE_float("num_train_epochs", 3.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
@@ -631,40 +633,33 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
   query_hidden = tf.reshape(query_hidden, [batch_size, query_length, hidden_size])
   doc_hidden = tf.reshape(doc_hidden, [batch_size, seq_length, hidden_size])
 
-  ############ 新版doc_hidden ############
-
-  # segment_onehot = tf.tile(segment_ids, [hidden_size, 1])
-  # segment_onehot = tf.reshape(segment_onehot, [hidden_size, batch_size, seq_length])
-  # segment_onehot = tf.transpose(segment_onehot, [1, 2, 0])
-  # segment_onehot = tf.cast(segment_onehot, tf.float32)
-  #
-  # doc_hidden = final_hidden * segment_onehot
+  LSTM_hidden = 128
+  query_hidden = Bidirectional(LSTM(LSTM_hidden))(query_hidden)
+  query_hidden = tf.expand_dims(query_hidden, -1)
 
 
-  print('doc_start:  ', modeling.get_shape_list(doc_start, expected_rank=1))
-  print('final hidden shape:  ', final_hidden_shape)
-  print('query hidden shape:  ', modeling.get_shape_list(query_hidden, expected_rank=3))
-  print('doc hidden shape:    ', modeling.get_shape_list(doc_hidden, expected_rank=3))
-  output_weights = tf.get_variable(
-      "cls/squad/output_weights", [2, hidden_size],
+  Ws = tf.get_variable(
+      "cls/squad/Ws", [hidden_size, 2*LSTM_hidden],
+      initializer=tf.truncated_normal_initializer(stddev=0.02))
+  We = tf.get_variable(
+      "cls/squad/We", [hidden_size, 2*LSTM_hidden],
       initializer=tf.truncated_normal_initializer(stddev=0.02))
 
-  output_bias = tf.get_variable(
-      "cls/squad/output_bias", [2], initializer=tf.zeros_initializer())
+  Ws = tf.expand_dims(Ws, 0)
+  We = tf.expand_dims(We, 0)
+  Ws = tf.tile(Ws, [batch_size, 1, 1])
+  We = tf.tile(We, [batch_size, 1, 1])
 
-  final_hidden_matrix = tf.reshape(doc_hidden,
-                                   [batch_size * seq_length, hidden_size])
-  logits = tf.matmul(final_hidden_matrix, output_weights, transpose_b=True)
-  logits = tf.nn.bias_add(logits, output_bias)
+  start_logits = tf.matmul(doc_hidden, Ws)
+  start_logits = tf.matmul(start_logits, query_hidden)
+  start_logits = tf.squeeze(start_logits)
 
-  logits = tf.reshape(logits, [batch_size, seq_length, 2])
-  logits = tf.transpose(logits, [2, 0, 1])
-
-  unstacked_logits = tf.unstack(logits, axis=0)
+  end_logits = tf.matmul(doc_hidden, We)
+  end_logits = tf.matmul(end_logits, query_hidden)
+  end_logits = tf.squeeze(end_logits)
 
 
   doc_start = tf.cast(doc_start, tf.float32)
-  (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
   final_start = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   final_end = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   i, final_start, final_end = tf.while_loop(cond, iter4final, [i0, final_start, final_end])
@@ -1301,7 +1296,7 @@ def main(_):
             filename=os.path.join(FLAGS.output_dir, "train.tf_record"),
             is_training=True)
         convert_examples_to_features(
-            examples=train_examples[:5000],
+            examples=train_examples,
             tokenizer=tokenizer,
             max_seq_length=FLAGS.max_seq_length,
             doc_stride=FLAGS.doc_stride,
