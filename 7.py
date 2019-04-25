@@ -79,14 +79,14 @@ flags.DEFINE_bool("do_train", True, "Whether to run training.")
 
 flags.DEFINE_bool("do_predict", True, "Whether to run eval on the dev set.")
 
-flags.DEFINE_integer("train_batch_size", 8, "Total batch size for training.")
+flags.DEFINE_integer("train_batch_size", 4, "Total batch size for training.")
 
-flags.DEFINE_integer("predict_batch_size", 8,
+flags.DEFINE_integer("predict_batch_size", 4,
                      "Total batch size for predictions.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 3.0,
+flags.DEFINE_float("num_train_epochs", 0.5,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
@@ -549,6 +549,54 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
   #     f.write(doc_record)
 
 
+def BiDAF(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
+    """""
+     Args:
+
+     Returns: batch * doc_len * 2
+    """""
+
+    def co_Attentions(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
+        """""
+         Args:
+
+         Returns: batch * doc_len * query_len
+        """""
+
+        Wc = tf.expand_dims(Wc, 0)
+        Wc = tf.tile(Wc, [batch_size, 1, 1])
+
+        query = tf.tile(query, [1, doc_len, 1])
+        doc = tf.reshape(tf.tile(doc, [1, query_len, 1]),
+                         [batch_size, query_len, doc_len, hidden_size])
+        doc = tf.transpose(doc, [0, 2, 1, 3])
+        doc = tf.reshape(doc, [batch_size, query_len * doc_len, hidden_size])
+
+        concat = tf.concat([query, doc, query * doc], 2)
+        final = tf.matmul(concat, Wc)
+        final = tf.reshape(final, [batch_size, doc_len, query_len])
+        return final
+
+    res = co_Attentions(query, doc, Wc, batch_size, query_len, doc_len, hidden_size)
+
+    c2q = tf.nn.softmax(res, axis=1)
+    UU = tf.matmul(c2q, query)
+
+    b = tf.reduce_max(res, axis=2)
+    b = tf.expand_dims(b, -1)
+    HH = tf.matmul(doc, b, transpose_a=True)
+    HH = tf.tile(HH, [1, 1, doc_len])
+    HH = tf.transpose(HH, [0, 2, 1])
+
+    GG = tf.concat([doc, UU, doc * UU, doc * HH], axis=2)
+    M = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(GG)
+    MM = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(M)
+
+    M = tf.concat([GG, M], 2)
+    MM = tf.concat([GG, MM], 2)
+
+
+    return (M, MM)
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, doc_start,
                  use_one_hot_embeddings):
@@ -607,20 +655,25 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
 
       return i + 1, query, doc
 
-  def iter4final(i, final_start, final_end):
+  def iter4final(i, start, end):
       offset = doc_start[i]
+      s = M[i]
+      e = MM[i]
 
-      s = tf.gather(start_logits, i)
-      s = tf.pad(s, [[offset, 0]])
-      s = s[0:seq_length]
-      final_start = final_start.write(i, [s])
+      s = tf.reshape(s, [-1])
+      s = tf.pad(s, [[5 * offset * hidden_size, 0]])
+      s = s[0: 5 * seq_length * hidden_size]
+      s = tf.reshape(s, [seq_length, 5 * hidden_size])
 
-      e = tf.gather(end_logits, i)
-      e = tf.pad(e, [[offset, 0]])
-      e = e[0:seq_length]
-      final_end = final_end.write(i, [e])
+      e = tf.reshape(e, [-1])
+      e = tf.pad(e, [[5 * offset * hidden_size, 0]])
+      e = e[0: 5 * seq_length * hidden_size]
+      e = tf.reshape(e, [seq_length, 5 * hidden_size])
 
-      return i + 1, final_start, final_end
+      start = start.write(i, [s])
+      end = end.write(i, [e])
+
+      return i + 1, start, end
 
 
   query_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
@@ -633,42 +686,45 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
   query_hidden = tf.reshape(query_hidden, [batch_size, query_length, hidden_size])
   doc_hidden = tf.reshape(doc_hidden, [batch_size, seq_length, hidden_size])
 
-  LSTM_hidden = 128
-  query_hidden = Bidirectional(LSTM(LSTM_hidden))(query_hidden)
-  query_hidden = tf.expand_dims(query_hidden, -1)
+  # LSTM_hidden = 128
+  # query_hidden = Bidirectional(LSTM(LSTM_hidden))(query_hidden)
+  # query_hidden = Dropout(0.4)(query_hidden)
+  # query_hidden = tf.expand_dims(query_hidden, -1)
 
+  Wc = tf.get_variable('coAttention/Wc', [3 * hidden_size, 1],
+                       initializer=tf.truncated_normal_initializer(stddev=0.02))
+  Wp1 = tf.get_variable('coAttention/Wp1', [5 * hidden_size, 1],
+                        initializer=tf.truncated_normal_initializer(stddev=0.02))
+  Wp2 = tf.get_variable('coAttention/Wp2', [5 * hidden_size, 1],
+                        initializer=tf.truncated_normal_initializer(stddev=0.02))
+  # M and MM are contextualized representations for doc
+  M, MM = \
+      BiDAF(query_hidden, doc_hidden, Wc, batch_size, query_length, seq_length, hidden_size)
 
-  Ws = tf.get_variable(
-      "cls/squad/Ws", [hidden_size, 2*LSTM_hidden],
-      initializer=tf.truncated_normal_initializer(stddev=0.02))
-  We = tf.get_variable(
-      "cls/squad/We", [hidden_size, 2*LSTM_hidden],
-      initializer=tf.truncated_normal_initializer(stddev=0.02))
-
-  Ws = tf.expand_dims(Ws, 0)
-  We = tf.expand_dims(We, 0)
-  Ws = tf.tile(Ws, [batch_size, 1, 1])
-  We = tf.tile(We, [batch_size, 1, 1])
-
-  start_logits = tf.matmul(doc_hidden, Ws)
-  start_logits = tf.matmul(start_logits, query_hidden)
-  start_logits = tf.squeeze(start_logits)
-
-  end_logits = tf.matmul(doc_hidden, We)
-  end_logits = tf.matmul(end_logits, query_hidden)
-  end_logits = tf.squeeze(end_logits)
-
-
+  final_start_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
+  final_end_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   doc_start = tf.cast(doc_start, tf.float32)
-  final_start = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
-  final_end = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
-  i, final_start, final_end = tf.while_loop(cond, iter4final, [i0, final_start, final_end])
+
+  i, final_start_hidden, final_end_hidden = \
+      tf.while_loop(cond, iter4final, [i0, final_start_hidden, final_end_hidden])
+  final_start_hidden = tf.squeeze(final_start_hidden.stack())
+  final_end_hidden = tf.squeeze(final_end_hidden.stack())
+
+  Wp1 = tf.expand_dims(Wp1, 0)
+  Wp1 = tf.tile(Wp1, [batch_size, 1, 1])
+  Wp2 = tf.expand_dims(Wp2, 0)
+  Wp2 = tf.tile(Wp2, [batch_size, 1, 1])
+
+  final_start = tf.matmul(final_start_hidden, Wp1)
+  final_end = tf.matmul(final_end_hidden, Wp2)
+
+  final_start = tf.squeeze(final_start)
+  final_end = tf.squeeze(final_end)
+
 
   tf.logging.info("  doc_start = %s", doc_start)
-  tf.logging.info("  start_logits = %s", doc_start)
-  tf.logging.info("  final_start = %s", final_start.stack())
 
-  return (final_start.stack(), final_end.stack())
+  return (final_start, final_end)
 
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
@@ -1051,6 +1107,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
             all_predictions[example.qas_id] = best_non_null_entry.text
         else:
             all_predictions[example.qas_id] = ""
+
 
     all_nbest_json[example.qas_id] = nbest_json
 
