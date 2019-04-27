@@ -9,6 +9,9 @@ import modeling
 import optimization
 import six
 
+import horovod.tensorflow as hvd
+
+
 from keras.layers import LSTM
 from keras.layers import Bidirectional
 from keras.layers import Dropout
@@ -31,6 +34,10 @@ else:
 
 
 ## Required parameters
+flags.DEFINE_bool("use_multi_gpu", True, "Use multiple GPUs for training "
+                                          "using Horovod.")
+
+
 flags.DEFINE_string(
     "bert_config_file", bert_dir+'bert_config.json',
     "The config json file corresponding to the pre-trained BERT model. "
@@ -60,7 +67,7 @@ flags.DEFINE_bool(
     "Whether to lower case the input text. Should be True for uncased "
     "models and False for cased models.")
 flags.DEFINE_integer(
-    "max_seq_length", 384,
+    "max_seq_length", 256,
     "The maximum total input sequence length after WordPiece tokenization. "
     "Sequences longer than this will be truncated, and sequences shorter "
     "than this will be padded.")
@@ -592,6 +599,9 @@ def BiDAF(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
     M = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(GG)
     MM = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(M)
 
+    M = Dropout(0.4)(M)
+    MM = Dropout(0.4)(MM)
+
     M = tf.concat([GG, M], 2)
     MM = tf.concat([GG, MM], 2)
 
@@ -698,25 +708,31 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
   Wp2 = tf.get_variable('coAttention/Wp2', [5 * hidden_size, 1],
                         initializer=tf.truncated_normal_initializer(stddev=0.02))
   # M and MM are contextualized representations for doc
+
+  ##############
+  #### 这次尝试一个不一样的，直接把final_hidden当作doc_hidden这样后续就不用再调整位置了
+  ##############
   M, MM = \
-      BiDAF(query_hidden, doc_hidden, Wc, batch_size, query_length, seq_length, hidden_size)
+      BiDAF(query_hidden, final_hidden, Wc, batch_size, query_length, seq_length, hidden_size)
 
   final_start_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   final_end_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   doc_start = tf.cast(doc_start, tf.float32)
 
-  i, final_start_hidden, final_end_hidden = \
-      tf.while_loop(cond, iter4final, [i0, final_start_hidden, final_end_hidden])
-  final_start_hidden = tf.squeeze(final_start_hidden.stack())
-  final_end_hidden = tf.squeeze(final_end_hidden.stack())
+  # i, final_start_hidden, final_end_hidden = \
+  #     tf.while_loop(cond, iter4final, [i0, final_start_hidden, final_end_hidden])
+  # final_start_hidden = tf.squeeze(final_start_hidden.stack())
+  # final_end_hidden = tf.squeeze(final_end_hidden.stack())
 
   Wp1 = tf.expand_dims(Wp1, 0)
   Wp1 = tf.tile(Wp1, [batch_size, 1, 1])
   Wp2 = tf.expand_dims(Wp2, 0)
   Wp2 = tf.tile(Wp2, [batch_size, 1, 1])
 
-  final_start = tf.matmul(final_start_hidden, Wp1)
-  final_end = tf.matmul(final_end_hidden, Wp2)
+  # final_start = tf.matmul(final_start_hidden, Wp1)
+  # final_end = tf.matmul(final_end_hidden, Wp2)
+  final_start = tf.matmul(M, Wp1)
+  final_end = tf.matmul(MM, Wp2)
 
   final_start = tf.squeeze(final_start)
   final_end = tf.squeeze(final_end)
@@ -729,7 +745,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, use_multi_gpu):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -796,14 +812,13 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       start_positions = features["start_positions"]
       end_positions = features["end_positions"]
 
-      #####在这里要加上offset########
       start_loss = compute_loss(start_logits, start_positions)
       end_loss = compute_loss(end_logits, end_positions)
 
       total_loss = (start_loss + end_loss) / 2.0
 
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu, use_multi_gpu)
 
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
@@ -1283,6 +1298,9 @@ def validate_flags_or_throw(bert_config):
 
 
 def main(_):
+    if FLAGS.use_multi_gpu:
+        hvd.init()
+        FLAGS.output_dir = FLAGS.output_dir if hvd.rank() == 0 else os.path.join(FLAGS.output_dir, str(hvd.rank()))
 
     tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -1301,15 +1319,31 @@ def main(_):
             FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
     is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-    run_config = tf.contrib.tpu.RunConfig(
-        cluster=tpu_cluster_resolver,
-        master=FLAGS.master,
-        model_dir=FLAGS.output_dir,
-        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-        tpu_config=tf.contrib.tpu.TPUConfig(
-            iterations_per_loop=FLAGS.iterations_per_loop,
-            num_shards=FLAGS.num_tpu_cores,
-            per_host_input_for_training=is_per_host))
+
+    if FLAGS.use_multi_gpu:
+        config = tf.ConfigProto()
+        config.gpu_options.visible_device_list = str(hvd.local_rank())
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host),
+            log_step_count_steps=25,
+            session_config=config)
+    else:
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
 
     train_examples = None
     num_train_steps = None
@@ -1325,6 +1359,9 @@ def main(_):
         # buffer in in the `input_fn`.
         rng = random.Random(12345)
         rng.shuffle(train_examples)
+        if FLAGS.use_multi_gpu:
+            num_train_steps = num_train_steps // hvd.size()
+            num_warmup_steps = num_warmup_steps // hvd.size()
 
     model_fn = model_fn_builder(
         bert_config=bert_config,
@@ -1333,11 +1370,18 @@ def main(_):
         num_train_steps=num_train_steps,
         num_warmup_steps=num_warmup_steps,
         use_tpu=FLAGS.use_tpu,
-        use_one_hot_embeddings=FLAGS.use_tpu)
+        use_one_hot_embeddings=FLAGS.use_tpu,
+        use_multi_gpu=FLAGS.use_multi_gpu)
 
 
     # If TPU is not available, this will fall back to normal Estimator on CPU
     # or GPU.
+    if FLAGS.use_multi_gpu:
+        hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+    else:
+        hooks = []
+
+
     estimator = tf.contrib.tpu.TPUEstimator(
         use_tpu=FLAGS.use_tpu,
         model_fn=model_fn,
@@ -1353,7 +1397,7 @@ def main(_):
             filename=os.path.join(FLAGS.output_dir, "train.tf_record"),
             is_training=True)
         convert_examples_to_features(
-            examples=train_examples,
+            examples=train_examples[:5000],
             tokenizer=tokenizer,
             max_seq_length=FLAGS.max_seq_length,
             doc_stride=FLAGS.doc_stride,
