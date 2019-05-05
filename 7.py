@@ -16,16 +16,17 @@ from keras.layers import LSTM
 from keras.layers import Bidirectional
 from keras.layers import Dropout
 from keras.layers import Dense
+from keras.layers.normalization import BatchNormalization
 
 #######
 flags = tf.flags
 FLAGS = flags.FLAGS
 
-IS_ON_SERVER = 0
+IS_ON_SERVER = 1
 
 if IS_ON_SERVER:
     bert_dir = "/root/xcn/bert_base/uncased_L-12_H-768_A-12/"
-    out_dir = "/root/xcn/squad/"
+    out_dir = "/root/xcn/squad/out/"
     squad_dir = "/root/xcn/squad/"
 else:
     bert_dir = "/Users/xcn/Desktop/recent/uncased_L-12_H-768_A-12/"
@@ -51,13 +52,13 @@ flags.DEFINE_string(
     "The output directory where the model checkpoints will be written.")
 
 ## Other parameters
-flags.DEFINE_string("train_file", squad_dir + 'train-v2.0.json',
+flags.DEFINE_string("train_file", squad_dir + 'train-v1.1.json',
                     "SQuAD json for training. E.g., train-v1.1.json")
 flags.DEFINE_string(
-    "predict_file", squad_dir + 'dev-v2.0.json',
+    "predict_file", squad_dir + 'dev-v1.1.json',
     "SQuAD json for predictions. E.g., dev-v1.1.json or test-v1.1.json")
 flags.DEFINE_bool(
-    "version_2_with_negative", True,
+    "version_2_with_negative", False,
     "If true, the SQuAD examples contain some that do not have an answer.")
 flags.DEFINE_string(
     "init_checkpoint", bert_dir+'bert_model.ckpt',
@@ -93,7 +94,7 @@ flags.DEFINE_integer("predict_batch_size", 4,
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 0.5,
+flags.DEFINE_float("num_train_epochs", 2.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
@@ -404,8 +405,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
           all_doc_tokens, tok_start_position, tok_end_position, tokenizer,
           example.orig_answer_text)
 
-    # The -3 accounts for [CLS], [SEP] and [SEP]
-    max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
+    # The -4 accounts for [CLS], [SEP] ,[CLS] and [SEP]
+    max_tokens_for_doc = max_seq_length - len(query_tokens) - 4
 
     # We can have documents that are longer than the maximum sequence length.
     # To deal with this we do a sliding window approach, where we take chunks
@@ -436,13 +437,20 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
       tokens.append("[SEP]")
       segment_ids.append(0)
 
+      doc_start_position = len(segment_ids)
+
+      #start token for doc
+      tokens.append("[CLS]")
+      segment_ids.append(1)
+
+      # 将start_position定义为doc的相对位置
       for i in range(doc_span.length):
         split_token_index = doc_span.start + i
-        token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
+        token_to_orig_map[len(tokens) - doc_start_position] = tok_to_orig_index[split_token_index]
 
         is_max_context = _check_is_max_context(doc_spans, doc_span_index,
                                                split_token_index)
-        token_is_max_context[len(tokens)] = is_max_context
+        token_is_max_context[len(tokens) - doc_start_position] = is_max_context
         tokens.append(all_doc_tokens[split_token_index])
         segment_ids.append(1)
       tokens.append("[SEP]")
@@ -479,50 +487,57 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
           start_position = 0
           end_position = 0
         else:
-          doc_offset = len(query_tokens) + 2
-          start_position = tok_start_position - doc_start + doc_offset
-          end_position = tok_end_position - doc_start + doc_offset
+          # doc_offset = len(query_tokens) + 2
+          # start_position = tok_start_position - doc_start + doc_offset
+          # end_position = tok_end_position - doc_start + doc_offset
+
+          # +1 是因为doc的[CLS]标志
+          start_position = tok_start_position + 1
+          end_position = tok_end_position + 1
 
       if is_training and example.is_impossible:
         start_position = 0
         end_position = 0
 
-      doc_start_position = 0
-      for (i,data) in enumerate(segment_ids):
-          if(data == 1):
-              doc_start_position = i
-              break
+      # doc_start_position = 0
+      # for (i,data) in enumerate(segment_ids):
+      #     if(data == 1):
+      #         doc_start_position = i
+      #         break
       #######################################################
       ########               ################################
       ######## run examples  ################################
       ########               ################################
       #######################################################
-      if example_index < 20:
-          tf.logging.info("*** Example ***")
-          tf.logging.info("unique_id: %s" % (unique_id))
-          tf.logging.info("example_index: %s" % (example_index))
-          tf.logging.info("doc_span_index: %s" % (doc_span_index))
-          tf.logging.info("tokens: %s" % " ".join(
-              [tokenization.printable_text(x) for x in tokens]))
-          tf.logging.info("token_to_orig_map: %s" % " ".join(
-              ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
-          tf.logging.info("token_is_max_context: %s" % " ".join([
-              "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
-          ]))
-          tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-          tf.logging.info(
-              "input_mask: %s" % " ".join([str(x) for x in input_mask]))
-          tf.logging.info(
-              "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-          if is_training and example.is_impossible:
-              tf.logging.info("impossible example")
-          if is_training and not example.is_impossible:
-              answer_text = " ".join(tokens[start_position:(end_position + 1)])
-              tf.logging.info("start_position: %d" % (start_position))
-              tf.logging.info("end_position: %d" % (end_position))
-              tf.logging.info("doc_start: %d" % (doc_start_position))
-              tf.logging.info(
-                  "answer: %s" % (tokenization.printable_text(answer_text)))
+      # if example_index < 20:
+      #     tf.logging.info("*** Example ***")
+      #     tf.logging.info("unique_id: %s" % (unique_id))
+      #     tf.logging.info("example_index: %s" % (example_index))
+      #     tf.logging.info("doc_span_index: %s" % (doc_span_index))
+      #     tf.logging.info("tokens: %s" % " ".join(
+      #         [tokenization.printable_text(x) for x in tokens]))
+      #     tf.logging.info("token_to_orig_map: %s" % " ".join(
+      #         ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
+      #     tf.logging.info("token_is_max_context: %s" % " ".join([
+      #         "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
+      #     ]))
+      #     tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+      #     tf.logging.info(
+      #         "input_mask: %s" % " ".join([str(x) for x in input_mask]))
+      #     tf.logging.info(
+      #         "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+      #     if is_training and example.is_impossible:
+      #         tf.logging.info("impossible example")
+      #         tf.logging.info("start_position: %d" % (start_position))
+      #         tf.logging.info("end_position: %d" % (end_position))
+      #     if is_training and not example.is_impossible:
+      #         answer_text = " ".join(tokens[doc_start_position + start_position:
+      #                                       doc_start_position+ (end_position + 1)])
+      #         tf.logging.info("start_position: %d" % (start_position))
+      #         tf.logging.info("end_position: %d" % (end_position))
+      #         tf.logging.info("doc_start: %d" % (doc_start_position))
+      #         tf.logging.info(
+      #             "answer: %s" % (tokenization.printable_text(answer_text)))
       # doc_record = doc_record + (str(doc_start_position)) + ' '
       # doc_record += 'start_position:' + str(start_position) + ' '
       # doc_record += 'end_position:' + str(end_position) + ' '
@@ -556,14 +571,14 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
   #     f.write(doc_record)
 
 
-def BiDAF(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
+def BiDAF(query, doc, Wc, bc, batch_size, query_len, doc_len, hidden_size, lstm_hidden_size):
     """""
      Args:
 
-     Returns: batch * doc_len * 2
+     Returns: batch * doc_len * hidden
     """""
 
-    def co_Attentions(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
+    def co_Attentions(query, doc, Wc, bc, batch_size, query_len, doc_len, hidden_size):
         """""
          Args:
 
@@ -584,7 +599,7 @@ def BiDAF(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
         final = tf.reshape(final, [batch_size, doc_len, query_len])
         return final
 
-    res = co_Attentions(query, doc, Wc, batch_size, query_len, doc_len, hidden_size)
+    res = co_Attentions(query, doc, Wc, bc, batch_size, query_len, doc_len, hidden_size)
 
     c2q = tf.nn.softmax(res, axis=1)
     UU = tf.matmul(c2q, query)
@@ -596,14 +611,15 @@ def BiDAF(query, doc, Wc, batch_size, query_len, doc_len, hidden_size):
     HH = tf.transpose(HH, [0, 2, 1])
 
     GG = tf.concat([doc, UU, doc * UU, doc * HH], axis=2)
-    M = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(GG)
-    MM = Bidirectional(LSTM(hidden_size, return_sequences=True), merge_mode='ave')(M)
-
-    M = Dropout(0.4)(M)
-    MM = Dropout(0.4)(MM)
+    M = Bidirectional(LSTM(lstm_hidden_size, dropout=0.2, return_sequences=True),
+                      merge_mode='ave')(GG)
+    MM = Bidirectional(LSTM(lstm_hidden_size, dropout=0.2, return_sequences=True),
+                       merge_mode='ave')(GG)
 
     M = tf.concat([GG, M], 2)
     MM = tf.concat([GG, MM], 2)
+    M = BatchNormalization()(M)
+    MM = BatchNormalization()(MM)
 
 
     return (M, MM)
@@ -647,12 +663,15 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
       return tf.less(i, batch_size)
 
   def iter(i, query, doc):
+      # [cls] query [seq] | [cls] doc [seq]
+      #                   |
+      #               split here
 
       start = tf.gather(doc_start, i)
 
       q = tf.gather(final_hidden, i)
       q = tf.reshape(q, [-1])
-      q = tf.slice(q, [0], [start * hidden_size])
+      q = q[0: start * hidden_size]
       q = tf.pad(q, [[0, (query_length - start) * hidden_size]])
 
       d = tf.gather(final_hidden, i)
@@ -665,26 +684,6 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
 
       return i + 1, query, doc
 
-  def iter4final(i, start, end):
-      offset = doc_start[i]
-      s = M[i]
-      e = MM[i]
-
-      s = tf.reshape(s, [-1])
-      s = tf.pad(s, [[5 * offset * hidden_size, 0]])
-      s = s[0: 5 * seq_length * hidden_size]
-      s = tf.reshape(s, [seq_length, 5 * hidden_size])
-
-      e = tf.reshape(e, [-1])
-      e = tf.pad(e, [[5 * offset * hidden_size, 0]])
-      e = e[0: 5 * seq_length * hidden_size]
-      e = tf.reshape(e, [seq_length, 5 * hidden_size])
-
-      start = start.write(i, [s])
-      end = end.write(i, [e])
-
-      return i + 1, start, end
-
 
   query_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
   doc_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
@@ -696,49 +695,39 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids, d
   query_hidden = tf.reshape(query_hidden, [batch_size, query_length, hidden_size])
   doc_hidden = tf.reshape(doc_hidden, [batch_size, seq_length, hidden_size])
 
-  # LSTM_hidden = 128
-  # query_hidden = Bidirectional(LSTM(LSTM_hidden))(query_hidden)
-  # query_hidden = Dropout(0.4)(query_hidden)
-  # query_hidden = tf.expand_dims(query_hidden, -1)
+  LSTM_hidden = 512
+  bidaf_hidden = 4 * hidden_size + LSTM_hidden
+
 
   Wc = tf.get_variable('coAttention/Wc', [3 * hidden_size, 1],
                        initializer=tf.truncated_normal_initializer(stddev=0.02))
-  Wp1 = tf.get_variable('coAttention/Wp1', [5 * hidden_size, 1],
+  bc = tf.get_variable('coAttention/bc', [1], initializer=tf.zeros_initializer())
+
+  Wp1 = tf.get_variable('coAttention/Wp1', [bidaf_hidden, 1],
                         initializer=tf.truncated_normal_initializer(stddev=0.02))
-  Wp2 = tf.get_variable('coAttention/Wp2', [5 * hidden_size, 1],
+  bp1 = tf.get_variable('coAttention/bp1', [1], initializer=tf.zeros_initializer())
+
+  Wp2 = tf.get_variable('coAttention/Wp2', [bidaf_hidden, 1],
                         initializer=tf.truncated_normal_initializer(stddev=0.02))
+  bp2 = tf.get_variable('coAttention/bp2', [1], initializer=tf.zeros_initializer())
+
   # M and MM are contextualized representations for doc
 
-  ##############
-  #### 这次尝试一个不一样的，直接把final_hidden当作doc_hidden这样后续就不用再调整位置了
-  ##############
   M, MM = \
-      BiDAF(query_hidden, final_hidden, Wc, batch_size, query_length, seq_length, hidden_size)
+      BiDAF(query_hidden, doc_hidden, Wc, bc, batch_size, query_length, seq_length, hidden_size, LSTM_hidden)
 
-  final_start_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
-  final_end_hidden = tf.TensorArray(size=1, dtype=tf.float32, dynamic_size=True)
-  doc_start = tf.cast(doc_start, tf.float32)
 
-  # i, final_start_hidden, final_end_hidden = \
-  #     tf.while_loop(cond, iter4final, [i0, final_start_hidden, final_end_hidden])
-  # final_start_hidden = tf.squeeze(final_start_hidden.stack())
-  # final_end_hidden = tf.squeeze(final_end_hidden.stack())
+  M = tf.reshape(M, [batch_size * seq_length, bidaf_hidden])
+  MM = tf.reshape(MM, [batch_size * seq_length, bidaf_hidden])
 
-  Wp1 = tf.expand_dims(Wp1, 0)
-  Wp1 = tf.tile(Wp1, [batch_size, 1, 1])
-  Wp2 = tf.expand_dims(Wp2, 0)
-  Wp2 = tf.tile(Wp2, [batch_size, 1, 1])
-
-  # final_start = tf.matmul(final_start_hidden, Wp1)
-  # final_end = tf.matmul(final_end_hidden, Wp2)
   final_start = tf.matmul(M, Wp1)
+  final_start = tf.nn.bias_add(final_start, bp1)
   final_end = tf.matmul(MM, Wp2)
+  final_end = tf.nn.bias_add(final_end, bp2)
 
-  final_start = tf.squeeze(final_start)
-  final_end = tf.squeeze(final_end)
+  final_start = tf.reshape(final_start, [batch_size, seq_length])
+  final_end = tf.reshape(final_end, [batch_size, seq_length])
 
-
-  tf.logging.info("  doc_start = %s", doc_start)
 
   return (final_start, final_end)
 
@@ -1034,10 +1023,21 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
         break
       feature = features[pred.feature_index]
       if pred.start_index > 0:  # this is a non-null prediction
-        tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+        # tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+        # orig_doc_start = feature.token_to_orig_map[pred.start_index]
+        # orig_doc_end = feature.token_to_orig_map[pred.end_index]
+        # orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+
+        #这里预测的位置直接就是doc的位置， 所以好像map的意义不大
+        token_start_index = feature.doc_start + pred.start_index
+        token_end_index = feature.doc_start + pred.end_index
+        tok_tokens = feature.tokens[token_start_index:(token_end_index + 1)]
+
+        # orig_tokens = example.doc_tokens[pred.start_index:(pred.end_index + 1)]
         orig_doc_start = feature.token_to_orig_map[pred.start_index]
         orig_doc_end = feature.token_to_orig_map[pred.end_index]
         orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+
         tok_text = " ".join(tok_tokens)
 
         # De-tokenize WordPieces that have been split off.
@@ -1272,10 +1272,10 @@ def validate_flags_or_throw(bert_config):
   """Validate the input FLAGS or throw an exception."""
   tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
                                                 FLAGS.init_checkpoint)
-
+  """
   if not FLAGS.do_train and not FLAGS.do_predict:
     raise ValueError("At least one of `do_train` or `do_predict` must be True.")
-
+  """
   if FLAGS.do_train:
     if not FLAGS.train_file:
       raise ValueError(
@@ -1397,7 +1397,7 @@ def main(_):
             filename=os.path.join(FLAGS.output_dir, "train.tf_record"),
             is_training=True)
         convert_examples_to_features(
-            examples=train_examples[:5000],
+            examples=train_examples,
             tokenizer=tokenizer,
             max_seq_length=FLAGS.max_seq_length,
             doc_stride=FLAGS.doc_stride,
